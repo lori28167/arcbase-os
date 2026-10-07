@@ -39,8 +39,32 @@ export function pathJoin(base: string, path: string) {
 	return base.replace(/\/$/, '') + '/' + path.replace(/^\//, '')
 }
 
+export type DomainAccessInfo = {enabled: boolean; domain: string; appHostTemplate: string}
+
+// Public domain routed to ArcbaseOS by a tunnel such as cloudflared. Kept at
+// module level because app URLs are built outside React render.
+let domainAccess: DomainAccessInfo | undefined
+
+export function setDomainAccess(value: DomainAccessInfo | undefined) {
+	domainAccess = value
+}
+
+/**
+ * The app's own public hostname, but only while the dashboard is open on the
+ * public domain. A tunnel routes hostnames rather than ports, so `domain:port`
+ * would not reach the app. LAN access keeps using `hostname:port`.
+ */
+export function domainAccessAppHostname(appId: string) {
+	if (!domainAccess?.enabled || !domainAccess.appHostTemplate.includes('{app}')) return
+	if (location.hostname.toLowerCase() !== domainAccess.domain) return
+	return domainAccess.appHostTemplate.replace('{app}', appId.toLowerCase())
+}
+
 export function appToUrl(app: UserApp, protocol = location.protocol) {
-	return isOnionPage() ? `${location.protocol}//${app.hiddenService}` : `${protocol}//${location.hostname}:${app.port}`
+	if (isOnionPage()) return `${location.protocol}//${app.hiddenService}`
+	const publicHostname = domainAccessAppHostname(app.id)
+	if (publicHostname) return `${protocol}//${publicHostname}`
+	return `${protocol}//${location.hostname}:${app.port}`
 }
 
 export function appToUrlWithAppPath(app: UserApp, protocol = location.protocol) {

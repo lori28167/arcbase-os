@@ -4,7 +4,7 @@ import {arrayIncludes} from 'ts-extras'
 
 import {pollStates} from '@/hooks/use-app-install'
 import {trpcReact, UserApp} from '@/trpc/trpc'
-import {keyBy} from '@/utils/misc'
+import {keyBy, setDomainAccess} from '@/utils/misc'
 
 export type AppT = {
 	id: string
@@ -94,6 +94,10 @@ const AppsContext = createContext<AppsContextT | null>(null)
 export function AppsProvider({children}: {children: React.ReactNode}) {
 	const appsQ = trpcReact.apps.list.useQuery()
 	const utils = trpcReact.useUtils()
+
+	// App URLs use per-app public hostnames when browsing on the public domain.
+	const domainAccessQ = trpcReact.domainAccess.get.useQuery()
+	useEffect(() => setDomainAccess(domainAccessQ.data), [domainAccessQ.data])
 
 	// Refetch apps when storage mounts so tiles recover on their own, e.g. an app
 	// marked "Storage unavailable" clears once its NAS comes back and the backend

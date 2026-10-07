@@ -54,6 +54,7 @@ export type SettingsItemId =
 	| 'beta-program'
 	| 'network'
 	| 'https-access'
+	| 'domain-access'
 	| 'external-dns'
 	| 'backups-restore'
 	| 'backups-rewind'
@@ -431,6 +432,10 @@ export function createSettingsCatalog(
 				t('https-access-certificate-settings-title'),
 				t('https-access-certificate-settings-description'),
 				t('https-access-download-certificate'),
+				'cloudflare',
+				'cloudflared',
+				t('domain-access.title'),
+				t('domain-access.row-description'),
 				'thunderbolt',
 				'egpu',
 				'gpu',
@@ -690,6 +695,14 @@ export function createSettingsCatalog(
 			title: t('https-access-network-title'),
 			description: t('https-access-description'),
 			keywords: ['https', t('https-access-view-instructions'), t('https-access-certificate-settings-title')],
+		},
+		{
+			kind: 'command',
+			id: 'domain-access',
+			target: {type: 'navigate', to: '/settings/advanced/domain-access'},
+			title: t('domain-access.title'),
+			description: t('domain-access.row-description'),
+			keywords: ['cloudflare', 'cloudflared', 'tunnel', 'domain', t('domain-access.domain')],
 		},
 		{
 			kind: 'command',

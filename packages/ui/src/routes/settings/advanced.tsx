@@ -20,15 +20,17 @@ import {useTorEnabled} from '@/hooks/use-tor-enabled'
 import {cn} from '@/lib/utils'
 import {useSettingsDialogProps} from '@/routes/settings/_components/shared'
 import {NetworkPanel} from '@/routes/settings/advanced-network'
+import {DomainAccessSettingsPanel} from '@/routes/settings/domain-access'
 import {HttpsCertificateSettingsPanel} from '@/routes/settings/https-access'
 import {ThunderboltSettingsPanel} from '@/routes/settings/thunderbolt'
 import {trpcReact} from '@/trpc/trpc'
 import {tw} from '@/utils/tw'
 
-type AdvancedPanel = 'overview' | 'network' | 'https-certificate' | 'thunderbolt'
+type AdvancedPanel = 'overview' | 'network' | 'https-certificate' | 'thunderbolt' | 'domain-access'
 
 function panelFromSelection(selection: string | undefined, isThunderboltSupported: boolean): AdvancedPanel {
 	if (selection === 'network') return 'network'
+	if (selection === 'domain-access') return 'domain-access'
 	if (selection === 'thunderbolt' && isThunderboltSupported) return 'thunderbolt'
 	return 'overview'
 }
@@ -38,7 +40,7 @@ export default function AdvancedSettingsDrawerOrDialog() {
 	const title = t('advanced-settings')
 	const dialogProps = useSettingsDialogProps()
 	const {advancedSelection} = useParams<{
-		advancedSelection?: 'beta-program' | 'network' | 'thunderbolt' | 'tor'
+		advancedSelection?: 'beta-program' | 'network' | 'thunderbolt' | 'tor' | 'domain-access'
 	}>()
 	const [searchParams] = useSearchParams()
 
@@ -102,6 +104,16 @@ export default function AdvancedSettingsDrawerOrDialog() {
 		</button>
 	)
 
+	const domainAccessSettingRow = (
+		<button
+			onClick={() => setActivePanel('domain-access')}
+			className={cn(cardClass, 'pointer-events-auto cursor-pointer text-left transition-colors hover:bg-white/8')}
+		>
+			<CardText title={t('domain-access.title')} description={t('domain-access.row-description')} />
+			<TbChevronRight className='pointer-events-auto mt-0.5 size-4.5 shrink-0 self-center text-white/30' />
+		</button>
+	)
+
 	const thunderboltSettingRow = isThunderboltSupported ? (
 		<button
 			onClick={() => setActivePanel('thunderbolt')}
@@ -149,6 +161,7 @@ export default function AdvancedSettingsDrawerOrDialog() {
 				/>
 			</label>
 			{networkSettingRow}
+			{domainAccessSettingRow}
 			{thunderboltSettingRow}
 			{remoteTorAccessSettingRow}
 			<label className={cardClass}>
@@ -163,6 +176,8 @@ export default function AdvancedSettingsDrawerOrDialog() {
 	const content =
 		activePanel === 'thunderbolt' && isThunderboltSupported ? (
 			<ThunderboltSettingsPanel onBack={() => setActivePanel('overview')} />
+		) : activePanel === 'domain-access' ? (
+			<DomainAccessSettingsPanel onBack={() => setActivePanel('overview')} />
 		) : activePanel === 'https-certificate' ? (
 			<HttpsCertificateSettingsPanel onBack={() => setActivePanel('network')} />
 		) : activePanel === 'network' ? (
