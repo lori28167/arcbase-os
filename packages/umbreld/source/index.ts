@@ -22,6 +22,7 @@ import Backups from './modules/backups/backups.js'
 import SystemNg from './modules/system-ng/system-ng.js'
 import Machines from './modules/machines/machines.js'
 import LanIngress from './modules/lan-ingress/lan-ingress.js'
+import DomainAccess, {type DomainAccessSettings} from './modules/domain-access/domain-access.js'
 import Auth from './modules/auth/auth.js'
 import Mcp, {type McpStoreSettings} from './modules/mcp/mcp.js'
 import Photos, {type PhotoBackupSource, type PhotoBackupSourceRemoval} from './modules/photos/photos.js'
@@ -80,6 +81,8 @@ type StoreSchema = {
 		}
 		externalDns?: boolean
 		hostname?: string
+		// Public domain routed to the dashboard by a tunnel such as cloudflared
+		domainAccess?: DomainAccessSettings
 		staticIp?: Record<
 			string,
 			{
@@ -180,6 +183,7 @@ export default class Umbreld {
 	systemNg: SystemNg
 	machines: Machines
 	lanIngress: LanIngress
+	domainAccess: DomainAccess
 	auth: Auth
 	mcp: Mcp
 	photos: Photos
@@ -214,6 +218,7 @@ export default class Umbreld {
 		this.systemNg = new SystemNg(this)
 		this.machines = new Machines(this)
 		this.lanIngress = new LanIngress(this)
+		this.domainAccess = new DomainAccess(this)
 		this.auth = new Auth(this)
 		this.mcp = new Mcp(this)
 		this.photos = new Photos(this)
@@ -290,6 +295,8 @@ export default class Umbreld {
 		// LAN ingress is the browser-facing boundary. Start it before the internal
 		// dashboard server and apps so public ports are owned by ingress and app-port
 		// nftables rules are in place before app proxies begin accepting traffic.
+		// Load the public domain before ingress starts routing browser traffic.
+		await this.domainAccess.start()
 		await this.lanIngress.start()
 
 		// Revoke restored credentials, pause restored Cloud entries and drop

@@ -295,14 +295,22 @@ export default class AppGateway {
 		try {
 			await this.isAuthorized(request)
 		} catch {
-			const origin = request.hostname.endsWith('.onion') ? 'tor' : 'host'
+			// Apps reached on their own public hostname log in on the domain's auth
+			// hostname, since a tunnel cannot reach the LAN-only `:2000` origin.
+			const domainAuthHost =
+				this.#umbreld.domainAccess?.match(request.hostname)?.kind === 'app'
+					? this.#umbreld.domainAccess.authHostname()
+					: null
+			const origin = domainAuthHost ? 'domain' : request.hostname.endsWith('.onion') ? 'tor' : 'host'
 			const searchParams = new URLSearchParams({
 				origin,
 				app: this.#config.appId,
 				path: request.originalUrl,
 			})
 			let host: string
-			if (origin === 'tor') {
+			if (domainAuthHost) {
+				host = domainAuthHost
+			} else if (origin === 'tor') {
 				host = await fse
 					.readFile(`${this.#umbreld.dataDirectory}/tor/data/auth/hostname`, 'utf8')
 					.then((value) => value.trim())

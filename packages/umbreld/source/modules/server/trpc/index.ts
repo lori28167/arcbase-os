@@ -19,6 +19,7 @@ import backups from '../../backups/routes.js'
 import shortcuts from '../../shortcuts/routes.js'
 import machines from '../../machines/routes.js'
 import lanIngress from '../../lan-ingress/routes.js'
+import domainAccess from '../../domain-access/routes.js'
 import mcp from '../../mcp/routes.js'
 import photos from '../../photos/routes.js'
 
@@ -42,6 +43,7 @@ const appRouter = router({
 	shortcuts,
 	machines,
 	lanIngress,
+	domainAccess,
 	mcp,
 	photos,
 })

@@ -5,6 +5,7 @@ import nodePath from 'node:path'
 import express from 'express'
 import fse from 'fs-extra'
 import got from 'got'
+import helmet from 'helmet'
 import {afterAll, beforeAll, describe, expect, test} from 'vitest'
 
 import Umbreld from '../../index.js'
@@ -85,5 +86,39 @@ describe('app auth account avatars', () => {
 	test('returns the account wallpaper appearance', async () => {
 		const response = await got(`${origin}/v1/account/wallpaper`, {responseType: 'json'})
 		expect(response.body).toEqual({id: '16', brandColorHsl: '265 100% 42%'})
+	})
+})
+
+describe('app auth on the public domain', () => {
+	const directory = temporaryDirectory()
+	let server: ReturnType<express.Express['listen']>
+	let origin: string
+
+	beforeAll(async () => {
+		await directory.createRoot()
+		const umbreld = new Umbreld({dataDirectory: await directory.create()})
+		await umbreld.domainAccess.set({enabled: true, domain: 'arcbase.example.com'})
+
+		const app = express()
+		app.set('trust proxy', 'loopback')
+		app.use(helmet.contentSecurityPolicy())
+		app.use(createAppAuthRouter(umbreld))
+		server = app.listen(0, '127.0.0.1')
+		await once(server, 'listening')
+		origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+	})
+
+	afterAll(async () => {
+		await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())))
+		await directory.destroyRoot()
+	})
+
+	test("only allows the login form to post to the app's public hostname", async () => {
+		const response = await got(`${origin}/v1/account/wallpaper?origin=domain&app=files&path=/`, {
+			headers: {'x-forwarded-proto': 'https', 'x-forwarded-host': 'auth.arcbase.example.com'},
+		})
+		const policy = response.headers['content-security-policy']
+		expect(policy).toContain("form-action 'self' https://files.arcbase.example.com")
+		expect(policy).not.toContain('*')
 	})
 })

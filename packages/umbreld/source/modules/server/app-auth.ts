@@ -14,7 +14,7 @@ import {resolveWallpaperAppearance} from '../user/wallpapers.js'
 
 type AppAuthRequest = {
 	appId: string
-	origin: 'host' | 'tor'
+	origin: 'host' | 'tor' | 'domain'
 	redirectPath: string
 }
 
@@ -29,7 +29,7 @@ function parseAppAuthRequest(request: express.Request): AppAuthRequest {
 	if (!/^[a-zA-Z0-9-]+$/.test(appId)) throw new Error('Invalid app')
 
 	const origin = requestString(request, 'origin')
-	if (origin !== 'host' && origin !== 'tor') throw new Error('Unsupported origin')
+	if (origin !== 'host' && origin !== 'tor' && origin !== 'domain') throw new Error('Unsupported origin')
 
 	const requestedPath = requestString(request, 'path')
 	let redirectPath = '/'
@@ -60,6 +60,10 @@ async function appHandoffFormAction(umbreld: Umbreld, request: express.Request) 
 	if (request.protocol !== 'http' && request.protocol !== 'https') return
 
 	const appId = request.query.app
+	if (request.query.origin === 'domain') {
+		const appHostname = typeof appId === 'string' ? umbreld.domainAccess.appHostname(appId) : null
+		return appHostname ? formActionSource(request.protocol, appHostname) : undefined
+	}
 	if (request.query.origin === 'tor' && typeof appId === 'string' && /^[a-zA-Z0-9-]+$/.test(appId)) {
 		try {
 			const hiddenService = (await umbreld.apps.getApp(appId).readHiddenService()).trim()
@@ -89,7 +93,11 @@ async function createHandoffResponse(umbreld: Umbreld, request: express.Request,
 	const manifest = await app.readManifest()
 
 	let host: string
-	if (origin === 'tor') {
+	if (origin === 'domain') {
+		const appHostname = umbreld.domainAccess.appHostname(appId)
+		if (!appHostname) throw new Error('Domain access is disabled')
+		host = appHostname
+	} else if (origin === 'tor') {
 		host = (await app.readHiddenService()).trim()
 		if (!host) throw new Error('App hidden service is unavailable')
 	} else {
@@ -122,7 +130,8 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
 	// App login finishes with a form POST from the dedicated auth port back to
 	// the app port. Helmet's default `form-action 'self'` blocks that because
 	// ports are part of an origin. Allow the current LAN hostname on another port,
-	// or the app's exact onion hostname when the login originated over Tor.
+	// the app's exact onion hostname when the login originated over Tor, or the
+	// app's exact public hostname when it originated on the configured domain.
 	router.use((request, response, next) => {
 		allowAppHandoffFormAction(umbreld, request, response).then(() => next(), next)
 	})

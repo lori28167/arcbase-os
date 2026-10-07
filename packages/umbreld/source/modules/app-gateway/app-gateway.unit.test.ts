@@ -5,6 +5,7 @@ import {WebSocket} from 'ws'
 import temporaryDirectory from '../utilities/temporary-directory.js'
 import AppGateway, {pathMatches, readAppGatewayConfig} from './app-gateway.js'
 import {appGatewayErrorPage} from './error-page.js'
+import DomainAccess from '../domain-access/domain-access.js'
 
 describe('app gateway configuration', () => {
 	const directories: Array<ReturnType<typeof temporaryDirectory>> = []
@@ -193,5 +194,61 @@ describe('app gateway error page', () => {
 		expect(body).toContain('&lt;script&gt;alert(1)&lt;/script&gt;')
 		expect(body).toContain('icon.svg&quot; onerror=&quot;alert(1)')
 		expect(body).toContain('Error code: &lt;BAD&gt;')
+	})
+})
+
+describe('app gateway login redirect', () => {
+	async function redirectFor(host: string, proto: string) {
+		const settings = {enabled: true, domain: 'arcbase.example.com', appHostTemplate: '{app}.arcbase.example.com'}
+		const logger = {createChildLogger: () => logger, log: vi.fn(), error: vi.fn()}
+		const domainAccess = new DomainAccess({logger, store: {get: async () => settings}} as never)
+		await domainAccess.start()
+		const gateway = new AppGateway(
+			{
+				logger,
+				domainAccess,
+				auth: {appAccessRevision: 0, authenticate: async () => Promise.reject(new Error('Unauthorized'))},
+			} as never,
+			{
+				appId: 'files',
+				appName: 'Files',
+				appIcon: 'https://example.com/files.svg',
+				targetProtocol: 'http',
+				targetHost: 'files_web_1',
+				targetAddress: '127.0.0.1',
+				targetPort: 1,
+				auth: true,
+				authWhitelist: [],
+				authBlacklist: [],
+				trustUpstream: false,
+				timeout: 100,
+			},
+		)
+		await new Promise<void>((resolve) => gateway.server.listen(0, '127.0.0.1', resolve))
+		try {
+			const address = gateway.server.address()
+			if (!address || typeof address === 'string') throw new Error('Gateway did not listen on TCP')
+			const response = await fetch(`http://127.0.0.1:${address.port}/settings?tab=1`, {
+				redirect: 'manual',
+				headers: {'x-forwarded-host': host, 'x-forwarded-proto': proto},
+			})
+			expect(response.status).toBe(302)
+			return new URL(response.headers.get('location')!)
+		} finally {
+			await new Promise<void>((resolve) => gateway.server.close(() => resolve()))
+		}
+	}
+
+	test('sends apps on their public hostname to the domain auth hostname', async () => {
+		const location = await redirectFor('files.arcbase.example.com', 'https')
+		expect(location.origin).toBe('https://auth.arcbase.example.com')
+		expect(location.pathname).toBe('/app-auth')
+		expect(Object.fromEntries(location.searchParams)).toEqual({origin: 'domain', app: 'files', path: '/settings?tab=1'})
+	})
+
+	test('keeps the LAN app-auth port for other hostnames', async () => {
+		const location = await redirectFor('umbrel.local', 'http')
+		expect(location.origin).toBe('http://umbrel.local:2000')
+		expect(location.searchParams.get('origin')).toBe('host')
 	})
 })

@@ -46,10 +46,24 @@ type IngressPortMapping = {
 	hiddenPort: number
 }
 
+type ListenerProtocol = 'http' | 'https'
+
+// The protocol the browser used, which can differ per request on the dashboard
+// ports when a tunnel such as cloudflared terminates HTTPS in front of them.
+type ProtocolResolver = ListenerProtocol | ((request: http.IncomingMessage) => ListenerProtocol)
+
 type UmbrelProxyOptions = {
 	includeForwardedFor?: boolean
 	pathPrefix?: string
 	redirectUnexpectedAppAuthNavigation?: boolean
+	// Route requests for the configured public domain by Host header.
+	domainRouting?: boolean
+	router?: (request: http.IncomingMessage) => string | undefined
+}
+
+type ProxyRequestHandler = {
+	handle: (request: http.IncomingMessage, response: http.ServerResponse) => void
+	upgrade: (request: http.IncomingMessage, socket: net.Socket, head: Buffer) => void
 }
 
 type AppMuxServer = {
@@ -801,13 +815,13 @@ export default class LanIngress {
 
 	private async ensureDashboardHttpServer() {
 		if (this.#dashboardHttpServer) return
-		this.#dashboardHttpServer = this.createHttpProxyServer(this.#umbreld.port, 'http')
+		this.#dashboardHttpServer = this.createHttpProxyServer(this.#umbreld.port, 'http', {domainRouting: true})
 		await this.listen(this.#dashboardHttpServer, 80)
 	}
 
 	private async ensureDashboardHttpsServer() {
 		if (this.#dashboardHttpsServer) return
-		this.#dashboardHttpsServer = await this.createHttpsProxyServer(this.#umbreld.port)
+		this.#dashboardHttpsServer = await this.createHttpsProxyServer(this.#umbreld.port, {domainRouting: true})
 		await this.listen(this.#dashboardHttpsServer, 443)
 	}
 
@@ -978,50 +992,53 @@ export default class LanIngress {
 
 	private createHttpProxyServer(
 		upstreamPort: number,
-		originalProtocol: 'http' | 'https',
+		originalProtocol: ListenerProtocol,
 		options: UmbrelProxyOptions = {},
 	) {
-		const middleware = this.createProxyMiddleware(upstreamPort, originalProtocol, options)
-		const server = http.createServer((request, response) => {
-			if (options.redirectUnexpectedAppAuthNavigation) {
-				const redirect = appAuthDashboardRedirect({
-					protocol: originalProtocol,
-					host: request.headers.host,
-					url: request.url,
-					method: request.method,
-					accept: request.headers.accept,
-				})
-				if (redirect) {
-					response.writeHead(302, {location: redirect})
-					response.end()
-					return
-				}
-			}
-			middleware(request as any, response as any, (error?: unknown) => {
-				// Reset instead of an error response for the same reason as onError above.
-				this.logger.verbose(`LAN ingress proxy error to ${upstreamPort}: ${error}`)
-				response.destroy()
-			})
-		})
+		const handler = this.createProxyRequestHandler(upstreamPort, originalProtocol, options)
+		const server = http.createServer(handler.handle)
 		// Let umbreld and upstream apps enforce their own upload deadlines.
 		// Keep the separate timeout for receiving request headers.
 		server.requestTimeout = 0
-		this.attachProxyUpgradeHandler(server, middleware)
+		server.on('upgrade', handler.upgrade)
 		return server
 	}
 
 	private async createHttpsProxyServer(upstreamPort: number, options: UmbrelProxyOptions = {}) {
-		const {includeForwardedFor = true, pathPrefix} = options
-		const middleware = this.createProxyMiddleware(upstreamPort, 'https', {includeForwardedFor, pathPrefix})
+		const {includeForwardedFor = true} = options
+		const handler = this.createProxyRequestHandler(upstreamPort, 'https', {...options, includeForwardedFor})
 		const server = https.createServer(
 			{
 				cert: await fse.readFile(this.serverCertificatePath),
 				key: await fse.readFile(this.serverKeyPath),
 			},
-			(request, response) => {
-				if (options.redirectUnexpectedAppAuthNavigation) {
+			handler.handle,
+		)
+		// Let umbreld and upstream apps enforce their own upload deadlines.
+		// Keep the separate timeout for receiving request headers.
+		server.requestTimeout = 0
+		server.on('upgrade', handler.upgrade)
+		return server
+	}
+
+	private createProxyRequestHandler(
+		upstreamPort: number,
+		listenerProtocol: ListenerProtocol,
+		options: UmbrelProxyOptions,
+	): ProxyRequestHandler {
+		const {domainRouting, redirectUnexpectedAppAuthNavigation, ...proxyOptions} = options
+		const selectMiddleware = domainRouting
+			? this.createDomainRouter(upstreamPort, listenerProtocol, proxyOptions)
+			: (() => {
+					const middleware = this.createProxyMiddleware(upstreamPort, listenerProtocol, proxyOptions)
+					return () => middleware
+				})()
+
+		return {
+			handle: (request, response) => {
+				if (redirectUnexpectedAppAuthNavigation) {
 					const redirect = appAuthDashboardRedirect({
-						protocol: 'https',
+						protocol: listenerProtocol,
 						host: request.headers.host,
 						url: request.url,
 						method: request.method,
@@ -1033,25 +1050,72 @@ export default class LanIngress {
 						return
 					}
 				}
+				const middleware = selectMiddleware(request)
+				if (!middleware) {
+					response.writeHead(404, {'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8'})
+					response.end('App not found')
+					return
+				}
 				middleware(request as any, response as any, (error?: unknown) => {
 					// Reset instead of an error response for the same reason as onError above.
 					this.logger.verbose(`LAN ingress proxy error to ${upstreamPort}: ${error}`)
 					response.destroy()
 				})
 			},
-		)
-		// Let umbreld and upstream apps enforce their own upload deadlines.
-		// Keep the separate timeout for receiving request headers.
-		server.requestTimeout = 0
-		this.attachProxyUpgradeHandler(server, middleware)
-		return server
+			upgrade: (request, socket, head) => {
+				const middleware = selectMiddleware(request)
+				if (!middleware) return socket.destroy()
+				middleware.upgrade?.(request as any, socket, head)
+			},
+		}
+	}
+
+	// Requests for the configured public domain (usually forwarded by cloudflared)
+	// are routed by Host header: the dashboard itself, the app-auth origin that
+	// `:2000` serves on the LAN, or an app on its own hostname. Every other Host
+	// keeps the normal LAN dashboard behavior.
+	private createDomainRouter(upstreamPort: number, listenerProtocol: ListenerProtocol, options: UmbrelProxyOptions) {
+		const protocol = (request: http.IncomingMessage) =>
+			this.#umbreld.domainAccess?.originalProtocol(request, listenerProtocol) ?? listenerProtocol
+		const appUpstreams = new WeakMap<http.IncomingMessage, number>()
+		const dashboard = this.createProxyMiddleware(upstreamPort, protocol, options)
+		const appAuth = this.createProxyMiddleware(upstreamPort, protocol, {...options, pathPrefix: '/app-auth'})
+		const apps = this.createProxyMiddleware(upstreamPort, protocol, {
+			// Same as the per-app HTTPS proxies: apps must not receive X-Forwarded-For.
+			includeForwardedFor: false,
+			router: (request) => {
+				const port = appUpstreams.get(request)
+				return port ? `http://127.0.0.1:${port}` : undefined
+			},
+		})
+
+		return (request: http.IncomingMessage) => {
+			const host = this.#umbreld.domainAccess?.match(request.headers.host)
+			if (!host || host.kind === 'dashboard') return dashboard
+			if (host.kind === 'auth') return appAuth
+			const port = this.getDomainAppUpstreamPort(host.label)
+			if (!port) return
+			appUpstreams.set(request, port)
+			return apps
+		}
+	}
+
+	// The loopback port serving an app's plain HTTP: its gateway when it has
+	// one, otherwise the app's own published or host-network port.
+	private getDomainAppUpstreamPort(label: string) {
+		for (const entry of this.#appMuxServers.values()) {
+			if (entry.route.id.toLowerCase() !== label) continue
+			return entry.gatewayServer ? this.serverPort(entry.gatewayServer) : entry.route.publicPort
+		}
 	}
 
 	private createProxyMiddleware(
 		upstreamPort: number,
-		originalProtocol: 'http' | 'https',
-		{includeForwardedFor = true, pathPrefix}: UmbrelProxyOptions = {},
+		originalProtocol: ProtocolResolver,
+		{includeForwardedFor = true, pathPrefix, router}: UmbrelProxyOptions = {},
 	): RequestHandler {
+		const protocolFor = (request: http.IncomingMessage) =>
+			typeof originalProtocol === 'function' ? originalProtocol(request) : originalProtocol
 		const rewritePath = pathPrefix
 			? (path: string) =>
 					path === pathPrefix || path.startsWith(`${pathPrefix}/`) || path.startsWith(`${pathPrefix}?`)
@@ -1061,8 +1125,13 @@ export default class LanIngress {
 		return createProxyMiddleware({
 			target: `http://127.0.0.1:${upstreamPort}`,
 			changeOrigin: false,
-			ws: true,
+			// Every server dispatches upgrades explicitly through middleware.upgrade().
+			// With `ws: true` the middleware would also subscribe itself to the server's
+			// upgrade event after its first request, which breaks Host-based routing
+			// where several middlewares share one server.
+			ws: false,
 			pathRewrite: rewritePath,
+			router,
 			// Umbrel-owned upstreams (dashboard, app-auth) get X-Forwarded-For since they
 			// only trust it from loopback. App upstreams must not: some apps reject any
 			// X-Forwarded-For from an unconfigured proxy (Home Assistant returns 400),
@@ -1078,13 +1147,13 @@ export default class LanIngress {
 			onProxyReq: (proxyRequest, request) => {
 				// The upstream target is always HTTP. Tell umbreld/app-auth/app-proxy
 				// whether the original browser request used HTTP or HTTPS.
-				proxyRequest.setHeader('x-forwarded-proto', originalProtocol)
+				proxyRequest.setHeader('x-forwarded-proto', protocolFor(request))
 				if (request.headers.host) proxyRequest.setHeader('x-forwarded-host', request.headers.host)
 			},
 			onProxyReqWs: (proxyRequest, request) => {
 				// WebSocket upgrade requests bypass onProxyReq, so mirror the same
 				// forwarded headers for ws:// and wss:// traffic.
-				proxyRequest.setHeader('x-forwarded-proto', originalProtocol)
+				proxyRequest.setHeader('x-forwarded-proto', protocolFor(request))
 				if (request.headers.host) proxyRequest.setHeader('x-forwarded-host', request.headers.host)
 			},
 			onProxyRes: (proxyResponse) => {
@@ -1105,10 +1174,6 @@ export default class LanIngress {
 				response.destroy()
 			},
 		})
-	}
-
-	private attachProxyUpgradeHandler(server: http.Server, middleware: RequestHandler) {
-		server.on('upgrade', (request, socket, head) => middleware.upgrade?.(request as any, socket as net.Socket, head))
 	}
 
 	private serverPort(server: net.Server | http.Server) {
