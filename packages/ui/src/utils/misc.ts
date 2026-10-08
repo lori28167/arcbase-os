@@ -39,14 +39,46 @@ export function pathJoin(base: string, path: string) {
 	return base.replace(/\/$/, '') + '/' + path.replace(/^\//, '')
 }
 
-export type DomainAccessInfo = {enabled: boolean; domain: string; appHostTemplate: string}
+export type DomainAccessInfo = {enabled: boolean; domain: string; effectiveAppHostTemplate: string}
+
+const DOMAIN_ACCESS_KEY = 'ARCBASE_DOMAIN_ACCESS'
+
+function readCachedDomainAccess(): DomainAccessInfo | undefined {
+	try {
+		const value = JSON.parse(localStorage.getItem(DOMAIN_ACCESS_KEY) ?? 'null')
+		if (typeof value?.domain === 'string' && typeof value?.effectiveAppHostTemplate === 'string') return value
+	} catch {
+		// Storage can be unavailable or hold stale data; wait for the query instead.
+	}
+}
 
 // Public domain routed to ArcbaseOS by a tunnel such as cloudflared. Kept at
-// module level because app URLs are built outside React render.
-let domainAccess: DomainAccessInfo | undefined
+// module level because app URLs are built outside React render, and cached so
+// app links are right before the settings query resolves on the next load.
+let domainAccess: DomainAccessInfo | undefined = readCachedDomainAccess()
+let appIdsByPort = new Map<string, string>()
 
-export function setDomainAccess(value: DomainAccessInfo | undefined) {
-	domainAccess = value
+export function setDomainAccess(value: DomainAccessInfo) {
+	domainAccess = {
+		enabled: value.enabled,
+		domain: value.domain,
+		effectiveAppHostTemplate: value.effectiveAppHostTemplate,
+	}
+	try {
+		localStorage.setItem(DOMAIN_ACCESS_KEY, JSON.stringify(domainAccess))
+	} catch {
+		// Only a load-time optimisation; the in-memory value is already updated.
+	}
+}
+
+// Lets `umbrel:<port>` shortcuts resolve to an app's public hostname.
+export function setDomainAccessApps(apps: {id: string; port: number}[]) {
+	appIdsByPort = new Map(apps.map((app) => [String(app.port), app.id]))
+}
+
+function isOnDomainAccessHost() {
+	if (!domainAccess?.enabled) return false
+	return location.hostname.toLowerCase().replace(/\.$/, '') === domainAccess.domain
 }
 
 /**
@@ -55,9 +87,19 @@ export function setDomainAccess(value: DomainAccessInfo | undefined) {
  * would not reach the app. LAN access keeps using `hostname:port`.
  */
 export function domainAccessAppHostname(appId: string) {
-	if (!domainAccess?.enabled || !domainAccess.appHostTemplate.includes('{app}')) return
-	if (location.hostname.toLowerCase() !== domainAccess.domain) return
-	return domainAccess.appHostTemplate.replace('{app}', appId.toLowerCase())
+	if (!isOnDomainAccessHost() || !domainAccess!.effectiveAppHostTemplate.includes('{app}')) return
+	return domainAccess!.effectiveAppHostTemplate.replace('{app}', appId.toLowerCase())
+}
+
+/** URL for a `umbrel:<port>[/path]` shortcut target on the current host. */
+export function umbrelPortUrl(portAndPath: string, protocol = location.protocol) {
+	const separator = portAndPath.search(/[/?#]/)
+	const port = separator === -1 ? portAndPath : portAndPath.slice(0, separator)
+	const rest = separator === -1 ? '' : portAndPath.slice(separator)
+	const appId = appIdsByPort.get(port)
+	const publicHostname = appId ? domainAccessAppHostname(appId) : undefined
+	if (publicHostname) return `${protocol}//${publicHostname}${rest}`
+	return `${protocol}//${location.hostname}:${portAndPath}`
 }
 
 export function appToUrl(app: UserApp, protocol = location.protocol) {

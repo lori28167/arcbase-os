@@ -9,6 +9,7 @@ import {useShortcuts} from '@/hooks/use-shortcuts'
 import {cn} from '@/lib/utils'
 import {trpcReact} from '@/trpc/trpc'
 import {t} from '@/utils/i18n'
+import {umbrelPortUrl} from '@/utils/misc'
 
 import {ShortcutIconImage} from './shortcut-icon-image'
 
@@ -28,8 +29,7 @@ const PROTOCOL_OPTIONS: {value: Protocol; label: string; labelTKey?: string; pla
 /** Resolve a stored shortcut to an openable URL */
 export function resolveShortcutUrl(shortcut: {url: string}): string {
 	if (shortcut.url.startsWith('umbrel:')) {
-		const {protocol, hostname} = window.location
-		return `${protocol}//${hostname}:${shortcut.url.slice('umbrel:'.length)}`
+		return umbrelPortUrl(shortcut.url.slice('umbrel:'.length))
 	}
 	return shortcut.url
 }
@@ -124,9 +124,8 @@ export function ShortcutPopover({
 				setIcon(pageMetadataQuery.data.icon)
 				// For umbrel shortcuts, resolve icon URL relative to the device
 				if (fetchParams.url.startsWith('umbrel:')) {
-					const {protocol: p, hostname} = window.location
 					const port = fetchParams.url.slice('umbrel:'.length).split('/')[0]
-					setIconPreviewSrc(`${p}//${hostname}:${port}${new URL(pageMetadataQuery.data.icon).pathname}`)
+					setIconPreviewSrc(umbrelPortUrl(`${port}${new URL(pageMetadataQuery.data.icon).pathname}`))
 				} else {
 					setIconPreviewSrc(pageMetadataQuery.data.icon)
 				}
