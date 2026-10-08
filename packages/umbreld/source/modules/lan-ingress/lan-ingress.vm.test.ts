@@ -502,7 +502,8 @@ async function expectBrowserLoginFlow(browser: Browser, protocol: 'http' | 'http
 		const [loginResponse] = await Promise.all([
 			page.waitForResponse(
 				(response) =>
-					new URL(response.url()).pathname === '/v1/account/login' && response.request().method() === 'POST',
+					// The app-auth page calls its API under /app-auth on every origin.
+					new URL(response.url()).pathname === '/app-auth/v1/account/login' && response.request().method() === 'POST',
 			),
 			page.getByRole('button', {name: 'Open LAN Ingress Auth'}).click(),
 		])
