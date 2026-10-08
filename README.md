@@ -14,10 +14,11 @@ file, foto, backup, macchine virtuali, accesso HTTPS locale, Tor — e aggiunge:
 
 - **Accesso tramite dominio pubblico con cloudflared.** Configura un dominio in
   *Impostazioni → Impostazioni avanzate → Dominio pubblico (Cloudflare Tunnel)* e
-  la dashboard risponde su `arcbase.example.com`, il login delle app su
-  `auth.arcbase.example.com` e ogni app sul proprio nome host
-  (`<app-id>.arcbase.example.com`). Un tunnel instrada nomi host, non porte, quindi
-  questo è ciò che rende le app utilizzabili attraverso cloudflared.
+  la dashboard (con il login delle app) risponde su `home.example.com` e ogni app
+  sul proprio nome host (es. `<app-id>.example.com`). Un tunnel instrada nomi host,
+  non porte, quindi questo è ciò che rende le app utilizzabili attraverso cloudflared.
+  Le app senza login di ArcbaseOS restano private finché non le rendi pubbliche
+  una per una.
   Guida completa: [docs/cloudflared.md](docs/cloudflared.md).
 - **Branding ArcbaseOS** nell'interfaccia e nelle traduzioni.
 

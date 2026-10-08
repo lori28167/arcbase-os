@@ -6,23 +6,38 @@ import type Umbreld from '../../index.js'
 // as cloudflared forwards to the LAN ingress dashboard port (80, or 443 with
 // TLS verification disabled in the tunnel). A tunnel only routes hostnames, not
 // the per-app ports used on the LAN, so every app gets its own hostname built
-// from a template such as `{app}.arcbase.example.com`. App login happens on the
-// reserved `auth` hostname, mirroring the dedicated `:2000` origin on the LAN.
+// from a template such as `{app}.example.com`. App login happens on the
+// dashboard domain itself under `/app-auth`, so the dashboard session (and its
+// logout) also covers apps, like the shared hostname does on the LAN.
 
 export const APP_HOST_PLACEHOLDER = '{app}'
-export const AUTH_HOST_LABEL = 'auth'
 
 export type DomainAccessSettings = {
 	enabled: boolean
-	// Hostname serving the dashboard, e.g. `arcbase.example.com`.
+	// Hostname serving the dashboard, e.g. `home.example.com`.
 	domain: string
-	// Hostname template for apps, containing `{app}` exactly once.
-	appHostTemplate: string
+	// Custom hostname template for apps, containing `{app}` exactly once.
+	// Defaults to `{app}.<domain>` when unset.
+	appHostTemplate?: string
+	// Apps without ArcbaseOS login (no app gateway, or login turned off) that
+	// the owner explicitly chose to expose on the public domain.
+	publicApps?: string[]
 }
 
-export type DomainAccessHost = {kind: 'dashboard'} | {kind: 'auth'} | {kind: 'app'; label: string}
+export type DomainAccessInput = {
+	enabled: boolean
+	domain: string
+	appHostTemplate?: string
+	publicApps?: string[]
+}
+
+export type DomainAccessHost = {kind: 'dashboard'} | {kind: 'app'; label: string}
 
 const LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
+const APP_ID_PATTERN = /^[a-zA-Z0-9-]+$/
+// Names that only resolve on the local network or the device itself. A public
+// domain under them would shadow LAN hostnames like `umbrel.local`.
+const LOCAL_SUFFIXES = ['local', 'localhost', 'internal', 'lan', 'home.arpa', 'onion', 'test', 'invalid']
 
 export function normalizeHostname(value: unknown) {
 	if (typeof value !== 'string') return null
@@ -32,6 +47,7 @@ export function normalizeHostname(value: unknown) {
 	if (labels.length < 2 || labels.some((label) => !LABEL_PATTERN.test(label))) return null
 	// A purely numeric final label would make this an IPv4 literal, not a domain.
 	if (/^[0-9]+$/.test(labels.at(-1)!)) return null
+	if (LOCAL_SUFFIXES.some((suffix) => hostname === suffix || hostname.endsWith(`.${suffix}`))) return null
 	return hostname
 }
 
@@ -47,21 +63,17 @@ export function normalizeAppHostTemplate(value: unknown) {
 	if (typeof value !== 'string') return null
 	const template = value.trim().toLowerCase().replace(/\.$/, '')
 	// App ids never contain dots, so the placeholder always expands inside a
-	// single DNS label. Check the reserved auth label expands to a valid name too.
-	if (!fillTemplate(template, 'x') || !fillTemplate(template, AUTH_HOST_LABEL)) return null
-	return template
+	// single DNS label.
+	return fillTemplate(template, 'x') ? template : null
 }
 
-export function defaultAppHostTemplate(domain: string) {
-	return `${APP_HOST_PLACEHOLDER}.${domain}`
+export function effectiveAppHostTemplate(settings: Pick<DomainAccessSettings, 'domain' | 'appHostTemplate'>) {
+	return settings.appHostTemplate ?? `${APP_HOST_PLACEHOLDER}.${settings.domain}`
 }
 
 export function appHostname(settings: DomainAccessSettings, appId: string) {
-	return fillTemplate(settings.appHostTemplate, appId.toLowerCase())
-}
-
-export function authHostname(settings: DomainAccessSettings) {
-	return fillTemplate(settings.appHostTemplate, AUTH_HOST_LABEL)
+	if (!APP_ID_PATTERN.test(appId)) return null
+	return fillTemplate(effectiveAppHostTemplate(settings), appId.toLowerCase())
 }
 
 // Strip the port from a Host header and lowercase it. IPv6 literals never match
@@ -82,12 +94,11 @@ export function matchDomainAccessHost(
 	if (!hostname) return
 	if (hostname === settings.domain) return {kind: 'dashboard'}
 
-	const [prefix, suffix] = settings.appHostTemplate.split(APP_HOST_PLACEHOLDER)
+	const [prefix, suffix] = effectiveAppHostTemplate(settings).split(APP_HOST_PLACEHOLDER)
 	if (hostname.length <= prefix.length + suffix.length) return
 	if (!hostname.startsWith(prefix) || !hostname.endsWith(suffix)) return
 	const label = hostname.slice(prefix.length, hostname.length - suffix.length)
 	if (!/^[a-z0-9-]+$/.test(label)) return
-	if (label === AUTH_HOST_LABEL) return {kind: 'auth'}
 	return {kind: 'app', label}
 }
 
@@ -95,34 +106,55 @@ function firstHeader(value: string | string[] | undefined) {
 	return Array.isArray(value) ? value[0] : value
 }
 
-// cloudflared talks plain HTTP to the dashboard port while the browser uses
-// HTTPS at Cloudflare's edge. Cloudflare reports the visitor's scheme in
-// `X-Forwarded-Proto` and `CF-Visitor`; callers only honour them for the
-// configured domain so LAN requests keep their real protocol.
-export function forwardedHttps(headers: http.IncomingHttpHeaders) {
-	const proto = firstHeader(headers['x-forwarded-proto'])?.split(',')[0]?.trim().toLowerCase()
-	if (proto === 'https') return true
+// The scheme the visitor used at Cloudflare's edge. cloudflared talks plain
+// HTTP to the dashboard port while the browser may use HTTPS, and Cloudflare
+// reports the visitor's scheme in `CF-Visitor` (and `X-Forwarded-Proto` next
+// to `CF-Ray`). This deliberately does not depend on the configured domain, so
+// saving or changing the domain never flips which session cookie a tunnel
+// request expects. A LAN client forging these headers only affects its own
+// requests: its Secure cookies are refused over plain HTTP.
+export function cloudflareVisitorScheme(headers: http.IncomingHttpHeaders): 'http' | 'https' | undefined {
 	const visitor = firstHeader(headers['cf-visitor'])
-	if (!visitor) return false
-	try {
-		return JSON.parse(visitor)?.scheme === 'https'
-	} catch {
-		return false
+	if (visitor) {
+		try {
+			const scheme = JSON.parse(visitor)?.scheme
+			if (scheme === 'http' || scheme === 'https') return scheme
+		} catch {}
 	}
+	if (!firstHeader(headers['cf-ray'])) return
+	const proto = firstHeader(headers['x-forwarded-proto'])?.split(',')[0]?.trim().toLowerCase()
+	return proto === 'http' || proto === 'https' ? proto : undefined
 }
 
-export function parseDomainAccessSettings(input: {
-	enabled: boolean
-	domain: string
-	appHostTemplate?: string
-}): DomainAccessSettings {
+// The protocol the browser used for a request reaching a dashboard listener.
+export function originalProtocol(request: http.IncomingMessage, listenerProtocol: 'http' | 'https') {
+	if (listenerProtocol === 'https') return 'https'
+	return cloudflareVisitorScheme(request.headers) === 'https' ? 'https' : 'http'
+}
+
+export function parseDomainAccessSettings(input: DomainAccessInput): DomainAccessSettings {
 	const domain = normalizeHostname(input.domain)
-	if (!domain) throw new Error('Invalid domain')
-	const appHostTemplate = normalizeAppHostTemplate(input.appHostTemplate?.trim() || defaultAppHostTemplate(domain))
-	if (!appHostTemplate) throw new Error(`Invalid app hostname template, it must contain ${APP_HOST_PLACEHOLDER} once`)
-	const settings = {enabled: input.enabled, domain, appHostTemplate}
-	if (authHostname(settings) === domain) throw new Error('The dashboard domain cannot be an app hostname')
-	return settings
+	if (!domain) throw new Error('Invalid domain. Use a public domain such as home.example.com')
+
+	let appHostTemplate: string | undefined
+	if (input.appHostTemplate?.trim()) {
+		const template = normalizeAppHostTemplate(input.appHostTemplate)
+		if (!template) {
+			throw new Error(
+				`Invalid app hostname template. It must contain ${APP_HOST_PLACEHOLDER} once and be a public domain`,
+			)
+		}
+		// Store the default as unset so it keeps following later domain changes.
+		if (template !== effectiveAppHostTemplate({domain})) appHostTemplate = template
+	}
+
+	const publicApps = [...new Set((input.publicApps ?? []).filter((appId) => APP_ID_PATTERN.test(appId)))].sort()
+	return {
+		enabled: input.enabled,
+		domain,
+		...(appHostTemplate ? {appHostTemplate} : {}),
+		...(publicApps.length > 0 ? {publicApps} : {}),
+	}
 }
 
 export default class DomainAccess {
@@ -146,22 +178,19 @@ export default class DomainAccess {
 		if (this.#settings?.enabled) this.logger.log(`Domain access enabled for ${this.#settings.domain}`)
 	}
 
-	// Synchronous so LAN ingress can route every request without awaiting the store.
-	get settings() {
-		return this.#settings
-	}
-
 	get() {
 		const settings = this.#settings
 		return {
 			enabled: settings?.enabled ?? false,
 			domain: settings?.domain ?? '',
+			// The custom template only, so the UI can leave the default empty.
 			appHostTemplate: settings?.appHostTemplate ?? '',
-			authHostname: settings ? authHostname(settings) : '',
+			effectiveAppHostTemplate: settings ? effectiveAppHostTemplate(settings) : '',
+			publicApps: settings?.publicApps ?? [],
 		}
 	}
 
-	async set(input: {enabled: boolean; domain: string; appHostTemplate?: string}) {
+	async set(input: DomainAccessInput) {
 		const settings = parseDomainAccessSettings(input)
 		await this.#umbreld.store.set('settings.domainAccess', settings)
 		this.#settings = settings
@@ -169,29 +198,21 @@ export default class DomainAccess {
 		return this.get()
 	}
 
-	async clear() {
-		await this.#umbreld.store.delete('settings.domainAccess')
-		this.#settings = undefined
-		return this.get()
-	}
-
 	match(host: string | undefined) {
 		return matchDomainAccessHost(this.#settings, host)
 	}
 
+	// Whether an app without ArcbaseOS login may be served on the domain.
+	isPublicApp(appId: string) {
+		return this.#settings?.publicApps?.includes(appId) ?? false
+	}
+
 	appHostname(appId: string) {
-		if (!/^[a-zA-Z0-9-]+$/.test(appId)) return null
 		return this.#settings?.enabled ? appHostname(this.#settings, appId) : null
 	}
 
-	authHostname() {
-		return this.#settings?.enabled ? authHostname(this.#settings) : null
-	}
-
-	// The protocol the browser used. Requests on the plain-HTTP port that carry
-	// the tunnel's HTTPS markers for the configured domain are HTTPS requests.
-	originalProtocol(request: http.IncomingMessage, listenerProtocol: 'http' | 'https'): 'http' | 'https' {
-		if (listenerProtocol === 'https') return 'https'
-		return this.match(request.headers.host) && forwardedHttps(request.headers) ? 'https' : 'http'
+	// Apps on the domain log in on the dashboard domain itself.
+	appAuthHostname() {
+		return this.#settings?.enabled ? this.#settings.domain : null
 	}
 }

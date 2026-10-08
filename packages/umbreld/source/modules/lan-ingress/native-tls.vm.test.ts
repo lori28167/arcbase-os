@@ -72,8 +72,12 @@ describe.sequential('Installed apps with native TLS', () => {
 		}
 	})
 
-	afterEach(({task}) => {
-		if (task.result?.state === 'fail') failed = true
+	afterEach(async ({task}) => {
+		if (task.result?.state !== 'fail' || failed) return
+		failed = true
+		// App lifecycle commands (e.g. docker compose) only report their output
+		// in the guest journal, so print it once for the first failure.
+		console.error(await umbreld.vm.sshAsRoot('journalctl -u umbrel --no-pager -n 200').catch(String))
 	})
 	beforeEach(({skip}) => {
 		if (failed) skip()

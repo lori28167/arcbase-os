@@ -35,7 +35,7 @@ function useAccounts() {
 	const [state, setState] = useState<{accounts: Account[]; isLoaded: boolean}>({accounts: [], isLoaded: false})
 
 	useEffect(() => {
-		fetch('/v1/account/accounts')
+		fetch('/app-auth/v1/account/accounts')
 			.then(async (res) => {
 				const data = (await res.json()) as unknown
 				setState({accounts: Array.isArray(data) ? (data as Account[]) : [], isLoaded: true})
@@ -128,7 +128,7 @@ export default function LoginWithUmbrel() {
 	}
 
 	useEffect(() => {
-		fetch('/v1/account/session' + document.location.search)
+		fetch('/app-auth/v1/account/session' + document.location.search)
 			.then(async (response) => {
 				if (response.ok) submitHandoff(await response.json())
 			})
@@ -356,7 +356,7 @@ function useLogin() {
 		shouldSubmit: () => boolean,
 	) => {
 		// Forward the query params to the login endpoint
-		return fetch('/v1/account/login' + document.location.search, {
+		return fetch('/app-auth/v1/account/login' + document.location.search, {
 			method: 'POST',
 			headers: {'Content-Type': 'application/json'},
 			body: JSON.stringify({userId, password, totpToken}),
@@ -411,7 +411,7 @@ function useApp(appId: string) {
 	const [app, setApp] = useState<App>({id: '', icon: '', name: ''})
 
 	useEffect(() => {
-		fetch(`/v1/apps?app=${appId}`).then(async (res) => {
+		fetch(`/app-auth/v1/apps?app=${appId}`).then(async (res) => {
 			const data = await res.json()
 			setApp({...data, icon: appId ? `https://getumbrel.github.io/umbrel-apps-gallery/${appId}/icon.svg` : undefined})
 		})
@@ -424,7 +424,7 @@ function useWallpaperId() {
 	const [wallpaper, setWallpaper] = useState<WallpaperId>()
 
 	useEffect(() => {
-		fetch('/v1/account/wallpaper')
+		fetch('/app-auth/v1/account/wallpaper')
 			.then(async (res) => {
 				const appearance = (await res.json()) as {id?: unknown}
 				const id = appearance.id

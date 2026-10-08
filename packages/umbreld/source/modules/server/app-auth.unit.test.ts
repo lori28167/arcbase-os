@@ -69,7 +69,7 @@ describe('app auth account avatars', () => {
 			expect.objectContaining({
 				userId: '0',
 				wallpaper: {id: '16', brandColorHsl: '265 100% 42%'},
-				avatarUrl: `/v1/account/avatar/0/${hash}.webp`,
+				avatarUrl: `/app-auth/v1/account/avatar/0/${hash}.webp`,
 			}),
 		])
 		expect(JSON.stringify(response.body)).not.toContain('avatarHash')

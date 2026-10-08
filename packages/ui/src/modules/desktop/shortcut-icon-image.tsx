@@ -1,6 +1,7 @@
 import {useCallback, useEffect, useLayoutEffect, useRef, useState} from 'react'
 
 import {cn} from '@/lib/utils'
+import {umbrelPortUrl} from '@/utils/misc'
 
 import {sampleEdgeColor} from './sample-edge-color'
 
@@ -13,9 +14,7 @@ const edgeColorCache = new Map<string, {bgColor: string; padded: boolean}>()
 export function resolveShortcutIcon(shortcut: {url: string; icon?: string}): string {
 	if (!shortcut.icon) return ''
 	if (shortcut.icon.startsWith('umbrel:')) {
-		const {protocol, hostname} = window.location
-		const rest = shortcut.icon.slice('umbrel:'.length)
-		return `${protocol}//${hostname}:${rest}`
+		return umbrelPortUrl(shortcut.icon.slice('umbrel:'.length))
 	}
 	return shortcut.icon
 }
