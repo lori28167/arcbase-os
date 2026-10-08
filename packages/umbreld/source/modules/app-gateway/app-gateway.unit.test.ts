@@ -1,6 +1,9 @@
 import {afterEach, describe, expect, test, vi} from 'vitest'
 import fse from 'fs-extra'
-import {WebSocket} from 'ws'
+import http from 'node:http'
+import type {AddressInfo} from 'node:net'
+
+import {WebSocket, WebSocketServer} from 'ws'
 
 import temporaryDirectory from '../utilities/temporary-directory.js'
 import AppGateway, {pathMatches, readAppGatewayConfig} from './app-gateway.js'
@@ -239,9 +242,9 @@ describe('app gateway login redirect', () => {
 		}
 	}
 
-	test('sends apps on their public hostname to the domain auth hostname', async () => {
+	test('sends apps on their public hostname to login on the dashboard domain', async () => {
 		const location = await redirectFor('files.arcbase.example.com', 'https')
-		expect(location.origin).toBe('https://auth.arcbase.example.com')
+		expect(location.origin).toBe('https://arcbase.example.com')
 		expect(location.pathname).toBe('/app-auth')
 		expect(Object.fromEntries(location.searchParams)).toEqual({origin: 'domain', app: 'files', path: '/settings?tab=1'})
 	})
@@ -250,5 +253,67 @@ describe('app gateway login redirect', () => {
 		const location = await redirectFor('umbrel.local', 'http')
 		expect(location.origin).toBe('http://umbrel.local:2000')
 		expect(location.searchParams.get('origin')).toBe('host')
+	})
+})
+
+describe('app gateway WebSocket authentication', () => {
+	test('never proxies an unauthenticated upgrade, even after an authorized request', async () => {
+		const upstream = http.createServer((_request, response) => response.end('ok'))
+		const wss = new WebSocketServer({server: upstream})
+		wss.on('connection', (socket) => socket.send('upstream'))
+		await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+		const upstreamPort = (upstream.address() as AddressInfo).port
+
+		const logger = {error: vi.fn()}
+		const gateway = new AppGateway(
+			{
+				logger,
+				auth: {
+					appAccessRevision: 0,
+					authenticate: async (token?: string) => {
+						// Real checks read the store, which gives an early upgrade time to race ahead.
+						await new Promise((resolve) => setTimeout(resolve, 100))
+						if (token !== 'valid') throw new Error('Unauthorized')
+						return {sessionId: 'session'}
+					},
+					authorizeApp: async () => {},
+					registerAppSocket: () => true,
+				},
+			} as never,
+			{
+				appId: 'files',
+				appName: 'Files',
+				appIcon: 'https://example.com/files.svg',
+				targetProtocol: 'http',
+				targetHost: '127.0.0.1',
+				targetAddress: '127.0.0.1',
+				targetPort: upstreamPort,
+				auth: true,
+				authWhitelist: [],
+				authBlacklist: [],
+				trustUpstream: false,
+				timeout: 1000,
+			},
+		)
+		await new Promise<void>((resolve) => gateway.server.listen(0, '127.0.0.1', resolve))
+		const port = (gateway.server.address() as AddressInfo).port
+		try {
+			// An authorized request first, which used to subscribe the proxy's own
+			// unauthenticated upgrade handler to the gateway server.
+			const response = await fetch(`http://127.0.0.1:${port}/`, {headers: {cookie: 'UMBREL_APP_SESSION=valid'}})
+			expect(await response.text()).toBe('ok')
+
+			const outcome = await new Promise<string>((resolve) => {
+				const socket = new WebSocket(`ws://127.0.0.1:${port}/`)
+				socket.once('message', () => resolve('message'))
+				socket.once('open', () => resolve('open'))
+				socket.once('error', () => resolve('rejected'))
+			})
+			expect(outcome).toBe('rejected')
+		} finally {
+			await new Promise<void>((resolve) => gateway.server.close(() => resolve()))
+			wss.close()
+			await new Promise<void>((resolve) => upstream.close(() => resolve()))
+		}
 	})
 })

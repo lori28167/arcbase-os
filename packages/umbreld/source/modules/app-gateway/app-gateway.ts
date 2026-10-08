@@ -193,7 +193,10 @@ export default class AppGateway {
 					? new https.Agent({servername: this.#config.targetHost})
 					: undefined,
 			changeOrigin: false,
-			ws: true,
+			// Upgrades are dispatched by handleUpgrade only after authentication.
+			// With `ws: true` the middleware would subscribe its own unauthenticated
+			// upgrade handler to the server after the first proxied request.
+			ws: false,
 			xfwd: false,
 			proxyTimeout: this.#config.timeout,
 			followRedirects: false,
@@ -295,11 +298,12 @@ export default class AppGateway {
 		try {
 			await this.isAuthorized(request)
 		} catch {
-			// Apps reached on their own public hostname log in on the domain's auth
-			// hostname, since a tunnel cannot reach the LAN-only `:2000` origin.
+			// Apps reached on their own public hostname log in on the dashboard
+			// domain, since a tunnel cannot reach the LAN-only `:2000` origin and the
+			// dashboard session then covers the app too.
 			const domainAuthHost =
 				this.#umbreld.domainAccess?.match(request.hostname)?.kind === 'app'
-					? this.#umbreld.domainAccess.authHostname()
+					? this.#umbreld.domainAccess.appAuthHostname()
 					: null
 			const origin = domainAuthHost ? 'domain' : request.hostname.endsWith('.onion') ? 'tor' : 'host'
 			const searchParams = new URLSearchParams({

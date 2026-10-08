@@ -19,6 +19,7 @@ import {forwardTcp} from './forward-tcp.js'
 import {readNativeTlsPrelude} from './native-tls-preread.js'
 import {getNativeTlsPolicy, matchesNativeTlsHostname, type NativeTlsPolicy} from '../apps/native-tls.js'
 import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-gateway/app-gateway.js'
+import {cloudflareVisitorScheme, originalProtocol} from '../domain-access/domain-access.js'
 
 const NFT_BIN = '/usr/sbin/nft'
 
@@ -58,8 +59,28 @@ type UmbrelProxyOptions = {
 	redirectUnexpectedAppAuthNavigation?: boolean
 	// Route requests for the configured public domain by Host header.
 	domainRouting?: boolean
-	router?: (request: http.IncomingMessage) => string | undefined
+	router?: (request: http.IncomingMessage) => string
+	// Remove client address headers a tunnel forwards before reaching an app.
+	stripClientAddressHeaders?: boolean
 }
+
+// Headers Cloudflare and other proxies use to report the client address. Apps
+// behind the public domain must not see them: some reject requests carrying
+// X-Forwarded-For from an unconfigured proxy, and others would trust a
+// forwarded address for IP allowlists while the actual peer is loopback.
+const CLIENT_ADDRESS_HEADERS = [
+	'x-forwarded-for',
+	'x-real-ip',
+	'forwarded',
+	'cf-connecting-ip',
+	'cf-connecting-ipv6',
+	'cf-pseudo-ipv4',
+	'true-client-ip',
+]
+
+// An upstream nothing listens on: if an app request ever reached the app
+// proxy without a resolved app, it must fail instead of hitting the dashboard.
+const UNROUTABLE_UPSTREAM = 'http://127.0.0.1:0'
 
 type ProxyRequestHandler = {
 	handle: (request: http.IncomingMessage, response: http.ServerResponse) => void
@@ -72,6 +93,9 @@ type AppMuxServer = {
 	httpsProxyServer?: https.Server
 	gatewayServer?: http.Server
 	loopbackServer?: net.Server
+	// The loopback port serving the app's plain HTTP, recorded at creation so
+	// it stays readable while the servers are closing.
+	upstreamPort: number
 }
 
 type ComposeFile = {
@@ -899,7 +923,7 @@ export default class LanIngress {
 				nativeTls: route.gateway ? undefined : route.nativeTls,
 			})
 			await this.listen(server, route.hiddenPort)
-			this.#appMuxServers.set(route.id, {route, server, httpsProxyServer, gatewayServer})
+			this.#appMuxServers.set(route.id, {route, server, httpsProxyServer, gatewayServer, upstreamPort})
 		}
 
 		// PREROUTING only handles incoming traffic. Host network forwarders such
@@ -1005,8 +1029,7 @@ export default class LanIngress {
 	}
 
 	private async createHttpsProxyServer(upstreamPort: number, options: UmbrelProxyOptions = {}) {
-		const {includeForwardedFor = true} = options
-		const handler = this.createProxyRequestHandler(upstreamPort, 'https', {...options, includeForwardedFor})
+		const handler = this.createProxyRequestHandler(upstreamPort, 'https', options)
 		const server = https.createServer(
 			{
 				cert: await fse.readFile(this.serverCertificatePath),
@@ -1027,12 +1050,12 @@ export default class LanIngress {
 		options: UmbrelProxyOptions,
 	): ProxyRequestHandler {
 		const {domainRouting, redirectUnexpectedAppAuthNavigation, ...proxyOptions} = options
+		const middleware = domainRouting
+			? undefined
+			: this.createProxyMiddleware(upstreamPort, listenerProtocol, proxyOptions)
 		const selectMiddleware = domainRouting
 			? this.createDomainRouter(upstreamPort, listenerProtocol, proxyOptions)
-			: (() => {
-					const middleware = this.createProxyMiddleware(upstreamPort, listenerProtocol, proxyOptions)
-					return () => middleware
-				})()
+			: () => middleware
 
 		return {
 			handle: (request, response) => {
@@ -1050,49 +1073,69 @@ export default class LanIngress {
 						return
 					}
 				}
-				const middleware = selectMiddleware(request)
-				if (!middleware) {
+				if (domainRouting && this.redirectDomainToHttps(request, response)) return
+				const selected = selectMiddleware(request)
+				if (!selected) {
 					response.writeHead(404, {'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8'})
-					response.end('App not found')
+					response.end('Not found')
 					return
 				}
-				middleware(request as any, response as any, (error?: unknown) => {
+				selected(request as any, response as any, (error?: unknown) => {
 					// Reset instead of an error response for the same reason as onError above.
 					this.logger.verbose(`LAN ingress proxy error to ${upstreamPort}: ${error}`)
 					response.destroy()
 				})
 			},
 			upgrade: (request, socket, head) => {
-				const middleware = selectMiddleware(request)
-				if (!middleware) return socket.destroy()
-				middleware.upgrade?.(request as any, socket, head)
+				// Never upgrade a plain-HTTP visit to the public domain to ws://.
+				if (domainRouting && this.isInsecureDomainVisit(request)) return socket.destroy()
+				const selected = selectMiddleware(request)
+				if (!selected) return socket.destroy()
+				selected.upgrade?.(request as any, socket, head)
 			},
 		}
 	}
 
+	// A visitor who typed http:// at Cloudflare's edge for the public domain.
+	// Passwords, session cookies and app handoffs must not cross the internet
+	// in clear text, whether or not "Always Use HTTPS" is on in Cloudflare.
+	private isInsecureDomainVisit(request: http.IncomingMessage) {
+		return (
+			cloudflareVisitorScheme(request.headers) === 'http' && !!this.#umbreld.domainAccess?.match(request.headers.host)
+		)
+	}
+
+	private redirectDomainToHttps(request: http.IncomingMessage, response: http.ServerResponse) {
+		if (!this.isInsecureDomainVisit(request)) return false
+		const host = request.headers.host!.replace(/:\d*$/, '')
+		const path = request.url?.startsWith('/') ? request.url : '/'
+		// 308 keeps the method, so a form POST is resent over HTTPS, not dropped.
+		response.writeHead(308, {location: `https://${host}${path}`, 'cache-control': 'no-store'})
+		response.end()
+		return true
+	}
+
 	// Requests for the configured public domain (usually forwarded by cloudflared)
-	// are routed by Host header: the dashboard itself, the app-auth origin that
-	// `:2000` serves on the LAN, or an app on its own hostname. Every other Host
+	// are routed by Host header: the dashboard domain serves the dashboard and
+	// app login, and each app is served on its own hostname. Every other Host
 	// keeps the normal LAN dashboard behavior.
 	private createDomainRouter(upstreamPort: number, listenerProtocol: ListenerProtocol, options: UmbrelProxyOptions) {
-		const protocol = (request: http.IncomingMessage) =>
-			this.#umbreld.domainAccess?.originalProtocol(request, listenerProtocol) ?? listenerProtocol
+		const protocol = (request: http.IncomingMessage) => originalProtocol(request, listenerProtocol)
 		const appUpstreams = new WeakMap<http.IncomingMessage, number>()
 		const dashboard = this.createProxyMiddleware(upstreamPort, protocol, options)
-		const appAuth = this.createProxyMiddleware(upstreamPort, protocol, {...options, pathPrefix: '/app-auth'})
 		const apps = this.createProxyMiddleware(upstreamPort, protocol, {
 			// Same as the per-app HTTPS proxies: apps must not receive X-Forwarded-For.
 			includeForwardedFor: false,
+			stripClientAddressHeaders: true,
 			router: (request) => {
 				const port = appUpstreams.get(request)
-				return port ? `http://127.0.0.1:${port}` : undefined
+				return port ? `http://127.0.0.1:${port}` : UNROUTABLE_UPSTREAM
 			},
 		})
 
 		return (request: http.IncomingMessage) => {
 			const host = this.#umbreld.domainAccess?.match(request.headers.host)
 			if (!host || host.kind === 'dashboard') return dashboard
-			if (host.kind === 'auth') return appAuth
 			const port = this.getDomainAppUpstreamPort(host.label)
 			if (!port) return
 			appUpstreams.set(request, port)
@@ -1100,22 +1143,48 @@ export default class LanIngress {
 		}
 	}
 
-	// The loopback port serving an app's plain HTTP: its gateway when it has
-	// one, otherwise the app's own published or host-network port.
-	private getDomainAppUpstreamPort(label: string) {
+	private findAppMuxServer(label: string) {
 		for (const entry of this.#appMuxServers.values()) {
-			if (entry.route.id.toLowerCase() !== label) continue
-			return entry.gatewayServer ? this.serverPort(entry.gatewayServer) : entry.route.publicPort
+			if (entry.route.id.toLowerCase() === label) return entry
 		}
+	}
+
+	// Whether an app is served behind ArcbaseOS login.
+	private isAppProtected(entry: AppMuxServer) {
+		return !!entry.route.gateway?.auth
+	}
+
+	// The loopback port serving an app on the public domain: its gateway when it
+	// has one, otherwise the app's own published or host-network port. Apps
+	// without ArcbaseOS login are only served once the owner opted them in.
+	private getDomainAppUpstreamPort(label: string) {
+		const entry = this.findAppMuxServer(label)
+		if (!entry) return
+		if (!this.isAppProtected(entry) && !this.#umbreld.domainAccess?.isPublicApp(entry.route.id)) return
+		return entry.upstreamPort
+	}
+
+	listUnprotectedAppIds() {
+		return [...this.#appMuxServers.values()]
+			.filter((entry) => !this.isAppProtected(entry))
+			.map((entry) => entry.route.id)
+			.sort()
 	}
 
 	private createProxyMiddleware(
 		upstreamPort: number,
 		originalProtocol: ProtocolResolver,
-		{includeForwardedFor = true, pathPrefix, router}: UmbrelProxyOptions = {},
+		{includeForwardedFor = true, pathPrefix, router, stripClientAddressHeaders}: UmbrelProxyOptions = {},
 	): RequestHandler {
 		const protocolFor = (request: http.IncomingMessage) =>
 			typeof originalProtocol === 'function' ? originalProtocol(request) : originalProtocol
+		const setForwardedHeaders = (proxyRequest: http.ClientRequest, request: http.IncomingMessage) => {
+			// The upstream target is always HTTP. Tell umbreld/app-auth/app-proxy
+			// whether the original browser request used HTTP or HTTPS.
+			proxyRequest.setHeader('x-forwarded-proto', protocolFor(request))
+			if (request.headers.host) proxyRequest.setHeader('x-forwarded-host', request.headers.host)
+			if (stripClientAddressHeaders) for (const header of CLIENT_ADDRESS_HEADERS) proxyRequest.removeHeader(header)
+		}
 		const rewritePath = pathPrefix
 			? (path: string) =>
 					path === pathPrefix || path.startsWith(`${pathPrefix}/`) || path.startsWith(`${pathPrefix}?`)
@@ -1144,18 +1213,10 @@ export default class LanIngress {
 				warn: this.logger.log,
 				error: this.logger.error,
 			}),
-			onProxyReq: (proxyRequest, request) => {
-				// The upstream target is always HTTP. Tell umbreld/app-auth/app-proxy
-				// whether the original browser request used HTTP or HTTPS.
-				proxyRequest.setHeader('x-forwarded-proto', protocolFor(request))
-				if (request.headers.host) proxyRequest.setHeader('x-forwarded-host', request.headers.host)
-			},
-			onProxyReqWs: (proxyRequest, request) => {
-				// WebSocket upgrade requests bypass onProxyReq, so mirror the same
-				// forwarded headers for ws:// and wss:// traffic.
-				proxyRequest.setHeader('x-forwarded-proto', protocolFor(request))
-				if (request.headers.host) proxyRequest.setHeader('x-forwarded-host', request.headers.host)
-			},
+			onProxyReq: (proxyRequest, request) => setForwardedHeaders(proxyRequest, request),
+			// WebSocket upgrade requests bypass onProxyReq, so mirror the same
+			// forwarded headers for ws:// and wss:// traffic.
+			onProxyReqWs: (proxyRequest, request) => setForwardedHeaders(proxyRequest, request),
 			onProxyRes: (proxyResponse) => {
 				// Do not let apps pin local origins to HTTPS; HSTS can remove browser warning bypass
 				// and HTTP fallback paths that are important for private local certs.

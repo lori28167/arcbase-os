@@ -44,17 +44,38 @@ async function createUpstream(name: string) {
 	return listen(server)
 }
 
-async function createIngress({dashboardPort, appPorts}: {dashboardPort: number; appPorts: Record<string, number>}) {
+type FakeApp = {port: number; protected?: boolean}
+
+async function createIngress({
+	dashboardPort,
+	apps,
+	publicApps,
+}: {
+	dashboardPort: number
+	apps: Record<string, FakeApp>
+	publicApps?: string[]
+}) {
 	const logger = {createChildLogger: () => logger, log: () => {}, verbose: () => {}, error: () => {}}
-	const settings = {enabled: true, domain: 'arcbase.example.com', appHostTemplate: '{app}.arcbase.example.com'}
+	const settings = {enabled: true, domain: 'arcbase.example.com', publicApps}
 	const domainAccess = new DomainAccess({logger, store: {get: async () => settings}} as never)
 	await domainAccess.start()
 	const ingress = new LanIngress({dataDirectory: '/tmp', logger, port: dashboardPort, domainAccess} as never)
 	const internals = ingress as unknown as {
-		getDomainAppUpstreamPort(label: string): number | undefined
+		findAppMuxServer(label: string): unknown
 		createHttpProxyServer(port: number, protocol: 'http', options: {domainRouting: boolean}): http.Server
 	}
-	vi.spyOn(internals, 'getDomainAppUpstreamPort').mockImplementation((label) => appPorts[label])
+	// Fake mux entries the way updateAppMuxServers records them. The gateway
+	// server is a closed server, as during an app restart: routing must only
+	// rely on the recorded upstream port.
+	vi.spyOn(internals, 'findAppMuxServer').mockImplementation((label) => {
+		const app = apps[label]
+		if (!app) return
+		return {
+			route: {id: label, publicPort: 1, hiddenPort: 2, gateway: app.protected === false ? undefined : {auth: true}},
+			gatewayServer: app.protected === false ? undefined : http.createServer(),
+			upstreamPort: app.port,
+		}
+	})
 	const server = internals.createHttpProxyServer(dashboardPort, 'http', {domainRouting: true})
 	return listen(server)
 }
@@ -70,42 +91,94 @@ function get(port: number, host: string, headers: Record<string, string> = {}) {
 	})
 }
 
+const tunnel = {'cf-visitor': '{"scheme":"https"}', 'cf-ray': 'test'}
+
 describe('LAN ingress domain routing', () => {
-	test('routes the dashboard, auth and app hostnames by Host header', async () => {
+	test('routes the dashboard, app login and app hostnames by Host header', async () => {
 		const dashboardPort = await createUpstream('dashboard')
 		const filesPort = await createUpstream('files')
-		const port = await createIngress({dashboardPort, appPorts: {files: filesPort}})
-		const tunnel = {'x-forwarded-proto': 'https'}
+		const port = await createIngress({dashboardPort, apps: {files: {port: filesPort}}})
 
 		const dashboard = JSON.parse((await get(port, 'arcbase.example.com', tunnel)).body) as Seen
 		expect(dashboard).toMatchObject({upstream: 'dashboard', url: '/', proto: 'https', host: 'arcbase.example.com'})
 
-		const auth = JSON.parse((await get(port, 'auth.arcbase.example.com', tunnel)).body) as Seen
-		expect(auth).toMatchObject({upstream: 'dashboard', url: '/app-auth/', proto: 'https'})
-
 		const app = JSON.parse((await get(port, 'files.arcbase.example.com', tunnel)).body) as Seen
 		expect(app).toMatchObject({upstream: 'files', url: '/', proto: 'https', host: 'files.arcbase.example.com'})
-		// Apps never receive X-Forwarded-For, matching the per-app HTTPS proxies.
-		expect(app.forwardedFor).toBeUndefined()
 
+		// App login lives on the dashboard domain; there is no auth hostname.
+		expect((await get(port, 'auth.arcbase.example.com', tunnel)).status).toBe(404)
 		expect((await get(port, 'missing.arcbase.example.com', tunnel)).status).toBe(404)
 	})
 
-	test('keeps the real protocol for LAN hosts and requests without tunnel headers', async () => {
+	test('strips client address headers the tunnel forwards before reaching apps', async () => {
 		const dashboardPort = await createUpstream('dashboard')
-		const port = await createIngress({dashboardPort, appPorts: {}})
+		const filesPort = await createUpstream('files')
+		const port = await createIngress({dashboardPort, apps: {files: {port: filesPort}}})
+
+		const app = JSON.parse(
+			(
+				await get(port, 'files.arcbase.example.com', {
+					...tunnel,
+					'x-forwarded-for': '192.168.1.10, 203.0.113.7',
+					'cf-connecting-ip': '203.0.113.7',
+				})
+			).body,
+		) as Seen
+		expect(app.upstream).toBe('files')
+		expect(app.forwardedFor).toBeUndefined()
+	})
+
+	test('serves apps without ArcbaseOS login only when the owner opted them in', async () => {
+		const dashboardPort = await createUpstream('dashboard')
+		const jellyfinPort = await createUpstream('jellyfin')
+		const adguardPort = await createUpstream('adguard')
+		const port = await createIngress({
+			dashboardPort,
+			apps: {jellyfin: {port: jellyfinPort, protected: false}, adguard: {port: adguardPort, protected: false}},
+			publicApps: ['jellyfin'],
+		})
+
+		expect(JSON.parse((await get(port, 'jellyfin.arcbase.example.com', tunnel)).body).upstream).toBe('jellyfin')
+		expect((await get(port, 'adguard.arcbase.example.com', tunnel)).status).toBe(404)
+	})
+
+	test('redirects plain HTTP visits to the public domain to HTTPS', async () => {
+		const dashboardPort = await createUpstream('dashboard')
+		const port = await createIngress({dashboardPort, apps: {}})
+
+		const response = await new Promise<http.IncomingMessage>((resolve, reject) => {
+			http
+				.get(
+					{
+						host: '127.0.0.1',
+						port,
+						path: '/login?next=1',
+						headers: {host: 'arcbase.example.com', 'cf-visitor': '{"scheme":"http"}'},
+					},
+					resolve,
+				)
+				.on('error', reject)
+		})
+		response.resume()
+		expect(response.statusCode).toBe(308)
+		expect(response.headers.location).toBe('https://arcbase.example.com/login?next=1')
+	})
+
+	test('keeps the real protocol for requests that did not come through Cloudflare', async () => {
+		const dashboardPort = await createUpstream('dashboard')
+		const port = await createIngress({dashboardPort, apps: {}})
 
 		const spoofed = JSON.parse((await get(port, 'umbrel.local', {'x-forwarded-proto': 'https'})).body) as Seen
 		expect(spoofed).toMatchObject({upstream: 'dashboard', proto: 'http'})
 
-		const plain = JSON.parse((await get(port, 'arcbase.example.com')).body) as Seen
-		expect(plain).toMatchObject({upstream: 'dashboard', proto: 'http'})
+		const lanDomain = JSON.parse((await get(port, 'arcbase.example.com')).body) as Seen
+		expect(lanDomain).toMatchObject({upstream: 'dashboard', proto: 'http'})
 	})
 
 	test('routes WebSocket upgrades by Host even after other hosts were proxied', async () => {
 		const dashboardPort = await createUpstream('dashboard')
 		const filesPort = await createUpstream('files')
-		const port = await createIngress({dashboardPort, appPorts: {files: filesPort}})
+		const port = await createIngress({dashboardPort, apps: {files: {port: filesPort}}})
 
 		// Serve plain requests on both hosts first: a middleware must not claim
 		// every later upgrade on the shared server.

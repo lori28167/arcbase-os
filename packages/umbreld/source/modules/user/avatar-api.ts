@@ -18,7 +18,7 @@ import type {Account} from './user.js'
 export function accountAvatarUrl(userId: string, hash: string, context: 'dashboard' | 'app-auth' = 'dashboard') {
 	const encodedUserId = encodeURIComponent(userId)
 	return context === 'app-auth'
-		? `/v1/account/avatar/${encodedUserId}/${hash}.webp`
+		? `/app-auth/v1/account/avatar/${encodedUserId}/${hash}.webp`
 		: `/api/accounts/${encodedUserId}/avatar/${hash}.webp`
 }
 
