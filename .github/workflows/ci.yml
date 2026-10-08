@@ -118,8 +118,17 @@ jobs:
     name: Build umbrelOS amd64
     needs: detect-changes
     if: needs.detect-changes.outputs.ui-only != 'true'
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - uses: actions/checkout@v3
       - uses: docker/setup-buildx-action@v3
       - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3
@@ -130,8 +139,17 @@ jobs:
     name: Build umbrelOS arm64
     needs: detect-changes
     if: needs.detect-changes.outputs.ui-only != 'true'
-    runs-on: ubicloud-standard-4-arm-ubuntu-2404
+    runs-on: ubuntu-24.04-arm
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - uses: actions/checkout@v3
       - uses: docker/setup-buildx-action@v3
       - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3
@@ -142,8 +160,17 @@ jobs:
     name: Build umbrelOS Pi
     needs: detect-changes
     if: needs.detect-changes.outputs.ui-only != 'true'
-    runs-on: ubicloud-standard-4-arm-ubuntu-2404
+    runs-on: ubuntu-24.04-arm
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - uses: actions/checkout@v3
       - uses: docker/setup-buildx-action@v3
       - uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # v3
@@ -157,8 +184,17 @@ jobs:
     name: Build umbrelOS amd64 VM image
     needs: [detect-changes, umbrelos-amd64-cache]
     if: needs.detect-changes.outputs.ui-only != 'true'
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - name: Checkout code
         uses: actions/checkout@v3
         with:
@@ -179,8 +215,8 @@ jobs:
         # backend errors, which would block every VM test that depends on this
         # image; the --cache-from import keeps the build fast regardless.
         run: SKIP_AMD64_RUGIX_BUNDLE=true SKIP_CACHE_EXPORT=true npm run build:amd64:rugix
-      # Hack to pass the image to the next job. We used to use upload-artifact but network performance
-      # is terrible between GitHub <> Ubicloud. Just abuse the cache for now which is local and fast.
+      # Hack to pass the image to the next job. The Actions cache is faster than
+      # upload-artifact for an image this size.
       - name: Cache OS image
         uses: actions/cache/save@v4
         with:
@@ -191,8 +227,17 @@ jobs:
     name: Build umbrelOS Pi VM image
     needs: [detect-changes, umbrelos-pi-cache]
     if: needs.detect-changes.outputs.ui-only != 'true' && needs.detect-changes.outputs.run-pi-tests == 'true'
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - name: Checkout code
         uses: actions/checkout@v3
         with:
@@ -271,12 +316,21 @@ jobs:
     name: VM test (${{ matrix.test.name }})
     needs: [detect-changes, umbrelos-amd64-vm-image-build, discover-vm-tests]
     if: needs.detect-changes.outputs.ui-only != 'true'
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         test: ${{ fromJSON(needs.discover-vm-tests.outputs.tests) }}
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - name: Checkout code
         uses: actions/checkout@v3
         with:
@@ -307,7 +361,7 @@ jobs:
   umbrelos-pi-vm:
     name: Pi VM test (${{ matrix.test.name }})
     needs: [umbrelos-pi-vm-image-build, discover-pi-vm-tests]
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     env:
       # nixpkgs revision QEMU is built from (nixos-26.05 as of 2026-07). Bump
       # deliberately to change the emulator version — the cache key below
@@ -318,6 +372,15 @@ jobs:
       matrix:
         test: ${{ fromJSON(needs.discover-pi-vm-tests.outputs.tests) }}
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - name: Checkout code
         uses: actions/checkout@v3
         with:
@@ -385,12 +448,21 @@ jobs:
     name: Integration test (${{ matrix.test.name }})
     needs: [detect-changes, discover-integration-tests, umbrelos-amd64-cache]
     if: needs.detect-changes.outputs.ui-only != 'true'
-    runs-on: ubicloud-standard-4-ubuntu-2404
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
         test: ${{ fromJSON(needs.discover-integration-tests.outputs.tests) }}
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - name: Checkout code
         uses: actions/checkout@v3
       - name: Setup node
@@ -516,11 +588,20 @@ jobs:
     name: Create release on tag
     if: startsWith(github.ref, 'refs/tags/')
     needs: [umbrelos-amd64-cache, umbrelos-arm64-cache, umbrelos-pi-cache]
-    runs-on: ubicloud-standard-16-ubuntu-2404
+    runs-on: ubuntu-24.04
     defaults:
       run:
         working-directory: packages/os
     steps:
+      # GitHub-hosted runners ship with large preinstalled toolchains this
+      # job doesn't use. Remove them so Docker and OS image builds fit on disk.
+      - name: Free disk space
+        # Runs before checkout, so not in a job's default working directory.
+        working-directory: /tmp
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force
+          df -h /
       - uses: actions/checkout@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
